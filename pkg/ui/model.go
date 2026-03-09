@@ -20,26 +20,31 @@ type Model struct {
 	Playlists   []provider.Playlist
 	SelectedPl  int
 	SelectedTr  int
-	Focused     string // "playlists", "tracks"
+	Focused     string // playlists or tracks
 	ProgressBar progress.Model
 	Width       int
 	Height      int
 	Error       error
 	Quitting    bool
 	Volume      float64 // 0 - 100
-	ColorIndex  int
 }
 
 func NewModel(engine *audio.Engine, prov provider.Provider) Model {
-	playlists, _ := prov.GetPlaylists()
+	playlists, err := prov.GetPlaylists()
+
+	pb := progress.New(
+		progress.WithDefaultGradient(),
+		progress.WithWidth(30),
+	)
+
 	return Model{
 		Engine:      engine,
 		Provider:    prov,
 		Playlists:   playlists,
 		Focused:     "playlists",
-		ProgressBar: progress.New(progress.WithDefaultGradient()),
+		ProgressBar: pb,
 		Volume:      50,
-		ColorIndex:  0,
+		Error:       err,
 	}
 }
 
@@ -58,13 +63,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.Focused == "playlists" && m.SelectedPl > 0 {
 				m.SelectedPl--
+				m.SelectedTr = 0
 			} else if m.Focused == "tracks" && m.SelectedTr > 0 {
 				m.SelectedTr--
 			}
 		case "down", "j":
 			if m.Focused == "playlists" && m.SelectedPl < len(m.Playlists)-1 {
 				m.SelectedPl++
-			} else if m.Focused == "tracks" && m.SelectedTr < len(m.Playlists[m.SelectedPl].Tracks)-1 {
+				m.SelectedTr = 0
+			} else if m.Focused == "tracks" && m.SelectedTr < len(m.currentTracks())-1 {
 				m.SelectedTr++
 			}
 		case "tab", "right", "l":
@@ -72,35 +79,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "shift+tab", "left", "h":
 			m.Focused = "playlists"
 		case "enter", " ":
-			if m.Focused == "tracks" {
-				track := m.Playlists[m.SelectedPl].Tracks[m.SelectedTr]
-				m.Error = m.Engine.Play(track.URL)
+			track, ok := m.currentTrack()
+			if !ok {
+				break
 			}
-		case "p":
-			m.Engine.Pause()
+			m.Error = m.Engine.Play(track.URL)
 		case "s":
 			m.Engine.Stop()
 		case "+", "=":
 			if m.Volume < 100 {
 				m.Volume += 5
-				m.Engine.SetVolume(m.Volume/50 - 1) // Map 0-100 to -1 to 1 (roughly)
+				m.Engine.SetVolume(m.Volume)
 			}
 		case "-", "_":
 			if m.Volume > 0 {
 				m.Volume -= 5
-				m.Engine.SetVolume(m.Volume/50 - 1)
+				m.Engine.SetVolume(m.Volume)
 			}
 		}
 
 	case tea.WindowSizeMsg:
 		m.Width = msg.Width
 		m.Height = msg.Height
-		m.ProgressBar.Width = msg.Width - 10
+		if msg.Width > 20 {
+			m.ProgressBar.Width = msg.Width - 24
+		}
 
 	case tickMsg:
-		if m.Engine.IsPlaying() {
-			m.ColorIndex++
-		}
 		return m, tick()
 	}
 
@@ -109,107 +114,149 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) View() string {
 	if m.Quitting {
-		return "\n  " + TitleStyle.Render("Terminally") + " - Stay focused. See you soon.\n\n"
+		return "\n  " + TitleStyle.Render("Terminal Music") + " - bye\n\n"
 	}
 
-	var s strings.Builder
-
-	// Dynamic Banner Color
-	bannerStyle := TitleStyle
-	if m.Engine.IsPlaying() {
-		bannerStyle = bannerStyle.Copy().Foreground(BannerColors[m.ColorIndex%len(BannerColors)])
+	if len(m.Playlists) == 0 {
+		errMsg := "No playlists loaded"
+		if m.Error != nil {
+			errMsg = m.Error.Error()
+		}
+		return RootStyle.Render(TitleStyle.Render(GetBanner()) + "\n\n" + ErrorStyle.Render(errMsg))
 	}
 
-	// Banner
-	s.WriteString(bannerStyle.Render(GetBanner()))
-	s.WriteString("\n")
+	pl := m.currentPlaylist()
+	track, hasTrack := m.currentTrack()
 
-	// Main Layout
-	leftColWidth := 25
-	rightColWidth := m.Width - leftColWidth - 8
+	leftColWidth := max(28, m.Width/3)
+	rightColWidth := max(36, m.Width-leftColWidth-10)
 
-	// Playlists Column
 	var playlists strings.Builder
-	playlists.WriteString(HighlightStyle.Render("   Playlists") + "\n\n")
-	for i, pl := range m.Playlists {
-		style := InactiveStyle
+	playlists.WriteString(TitleStyle.Render("Playlists") + "\n")
+	playlists.WriteString(SubtitleStyle.Render("Source: "+m.Provider.GetName()) + "\n\n")
+	for i, item := range m.Playlists {
 		prefix := "  "
+		style := MutedStyle
 		if i == m.SelectedPl && m.Focused == "playlists" {
-			style = ActiveStyle
-			prefix = "-> "
+			prefix = "> "
+			style = FocusedItemStyle
 		} else if i == m.SelectedPl {
-			style = TitleStyle
-			prefix = "  "
+			prefix = "* "
+			style = SelectedItemStyle
 		}
-		playlists.WriteString(style.Render(prefix+pl.Name) + "\n")
+		playlists.WriteString(style.Render(prefix+item.Name) + "\n")
 	}
 
-	// Tracks Column
 	var tracks strings.Builder
-	tracks.WriteString(HighlightStyle.Render("   Tracks: "+m.Playlists[m.SelectedPl].Name) + "\n\n")
-	for i, tr := range m.Playlists[m.SelectedPl].Tracks {
-		style := InactiveStyle
+	tracks.WriteString(TitleStyle.Render("Tracks") + "\n")
+	tracks.WriteString(SubtitleStyle.Render(pl.Description) + "\n\n")
+	for i, t := range pl.Tracks {
 		prefix := "  "
+		style := MutedStyle
 		if i == m.SelectedTr && m.Focused == "tracks" {
-			style = ActiveStyle
-			prefix = "-> "
+			prefix = "> "
+			style = FocusedItemStyle
 		} else if i == m.SelectedTr {
-			style = TitleStyle
-			prefix = "  "
+			prefix = "* "
+			style = SelectedItemStyle
 		}
-		tracks.WriteString(style.Render(prefix+tr.Title) + "\n      " + ArtistStyle.Render(tr.Artist) + "\n")
+		tracks.WriteString(style.Render(prefix+t.Title) + "\n")
+		tracks.WriteString(MutedStyle.Render("   "+t.Artist) + "\n")
 	}
 
-	// Sidebar + Main View
-	mainContent := lipgloss.JoinHorizontal(lipgloss.Top,
-		lipgloss.NewStyle().Width(leftColWidth).Render(playlists.String()),
-		lipgloss.NewStyle().Width(rightColWidth).PaddingLeft(4).Render(tracks.String()),
-	)
+	sidebar := PanelStyle.Width(leftColWidth).Render(playlists.String())
+	main := PanelStyle.Width(rightColWidth).Render(tracks.String())
+	content := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, "  ", main)
 
-	s.WriteString(BoxStyle.Width(m.Width - 4).Render(mainContent) + "\n\n")
-
-	// Now Playing Section
-	pos, _ := m.Engine.GetProgress()
-	status := "⏸  Paused"
+	status := "Stopped"
 	if m.Engine.IsPlaying() {
-		status = "▶  Streaming"
+		status = "Streaming"
 	}
 
-	// Simple animated wave/progress for streams
-	wave := "~~~~"
-	if m.Engine.IsPlaying() {
-		ticks := int(time.Now().Unix() % 4)
-		wave = strings.Repeat("~", ticks) + " " + strings.Repeat("~", 4-ticks)
+	duration, _ := m.Engine.GetProgress()
+	progressValue := float64((duration / time.Second) % 180)
+	progressValue = progressValue / 180.0
+	progressBar := m.ProgressBar.ViewAs(progressValue)
+
+	nowPlayingText := "Nothing playing"
+	if hasTrack {
+		nowPlayingText = fmt.Sprintf("%s - %s", track.Title, track.Artist)
 	}
 
-	nowPlaying := fmt.Sprintf("%s | %s | %s [%s]",
-		StatusStyle.Render(status),
-		m.Playlists[m.SelectedPl].Tracks[m.SelectedTr].Title,
-		ArtistStyle.Render(m.Playlists[m.SelectedPl].Tracks[m.SelectedTr].Artist),
-		HighlightStyle.Render(formatDuration(pos)),
-	)
+	nowPlaying := strings.Builder{}
+	nowPlaying.WriteString(TitleStyle.Render(GetBanner()) + "\n")
+	nowPlaying.WriteString(SubtitleStyle.Render("YouTube stream player") + "\n\n")
+	nowPlaying.WriteString(fmt.Sprintf("Status: %s\n", lipgloss.NewStyle().Foreground(Success).Render(status)))
+	nowPlaying.WriteString(fmt.Sprintf("Now: %s\n", nowPlayingText))
+	nowPlaying.WriteString(fmt.Sprintf("Elapsed: %s\n", formatDuration(duration)))
+	nowPlaying.WriteString(fmt.Sprintf("Volume: %.0f%%\n\n", m.Volume))
+	nowPlaying.WriteString(progressBar)
 
-	s.WriteString(MainStyle.Width(m.Width - 6).Render(nowPlaying + " " + wave) + "\n")
+	controls := "Enter/Space play  s stop  Tab switch panel  Arrows move  +/- volume  q quit"
 
-	// Controls
-	controls := " q: quit | space: play/pause | s: stop | tab: switch | arrows: move | +/-: volume "
-	s.WriteString("\n" + ControlStyle.Width(m.Width).Align(lipgloss.Center).Render(controls))
+	view := strings.Builder{}
+	view.WriteString(content + "\n\n")
+	view.WriteString(NowPlayingStyle.Width(m.Width - 6).Render(nowPlaying.String()))
+	view.WriteString("\n")
+	view.WriteString(ControlStyle.Render(controls))
 
 	if m.Error != nil {
-		s.WriteString("\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#e06c75")).Bold(true).Render(" ⚡ Error: "+m.Error.Error()))
+		view.WriteString("\n" + ErrorStyle.Render("Error: "+m.Error.Error()))
 	}
 
-	return lipgloss.NewStyle().Padding(1, 2).Render(s.String())
+	return RootStyle.Render(view.String())
+}
+
+func (m Model) currentPlaylist() provider.Playlist {
+	if len(m.Playlists) == 0 {
+		return provider.Playlist{}
+	}
+	if m.SelectedPl < 0 {
+		m.SelectedPl = 0
+	}
+	if m.SelectedPl >= len(m.Playlists) {
+		m.SelectedPl = len(m.Playlists) - 1
+	}
+	return m.Playlists[m.SelectedPl]
+}
+
+func (m Model) currentTracks() []provider.Track {
+	pl := m.currentPlaylist()
+	return pl.Tracks
+}
+
+func (m Model) currentTrack() (provider.Track, bool) {
+	tracks := m.currentTracks()
+	if len(tracks) == 0 {
+		return provider.Track{}, false
+	}
+	if m.SelectedTr < 0 {
+		m.SelectedTr = 0
+	}
+	if m.SelectedTr >= len(tracks) {
+		m.SelectedTr = len(tracks) - 1
+	}
+	return tracks[m.SelectedTr], true
 }
 
 func tick() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(400*time.Millisecond, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
 
 func formatDuration(d time.Duration) string {
+	if d < 0 {
+		return "00:00"
+	}
 	m := int(d.Minutes())
 	s := int(d.Seconds()) % 60
 	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

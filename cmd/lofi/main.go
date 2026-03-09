@@ -11,7 +11,6 @@ import (
 )
 
 func main() {
-	// Initialize Engine
 	engine, err := audio.NewEngine()
 	if err != nil {
 		fmt.Printf("Error initializing audio engine: %v\n", err)
@@ -19,13 +18,9 @@ func main() {
 	}
 	defer engine.Stop()
 
-	// Initialize Provider
-	prov := provider.NewStaticProvider()
-
-	// Initialize UI Model
+	prov := provider.NewYouTubeProvider()
 	m := ui.NewModel(engine, prov)
 
-	// Run Bubble Tea
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running program: %v\n", err)

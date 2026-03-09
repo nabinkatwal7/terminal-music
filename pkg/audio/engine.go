@@ -2,44 +2,31 @@ package audio
 
 import (
 	"fmt"
-	"net/http"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/faiface/beep"
-	"github.com/faiface/beep/effects"
-	"github.com/faiface/beep/mp3"
-	"github.com/faiface/beep/speaker"
 )
 
-// Engine manages the audio playback state.
+// Engine manages audio playback by streaming YouTube audio through yt-dlp + ffplay.
 type Engine struct {
 	mu           sync.Mutex
-	streamer     beep.StreamSeekCloser
-	format       beep.Format
-	ctrl         *beep.Ctrl
-	volume       *effects.Volume
-	sampleRate   beep.SampleRate
+	ytdlpCmd     *exec.Cmd
+	ffplayCmd    *exec.Cmd
 	playing      bool
 	currentTrack string
-	errorChan    chan error
+	startedAt    time.Time
+	volume       int
 }
 
-// NewEngine initializes the audio speaker and returns a new Engine.
+// NewEngine initializes a new Engine.
 func NewEngine() (*Engine, error) {
-	sr := beep.SampleRate(44100)
-	err := speaker.Init(sr, sr.N(time.Second/10))
-	if err != nil {
-		return nil, fmt.Errorf("failed to init speaker: %w", err)
-	}
-
 	return &Engine{
-		sampleRate: sr,
-		errorChan:  make(chan error, 1),
+		volume: 50,
 	}, nil
 }
 
-// Play streams audio from a URL.
+// Play streams audio from a YouTube URL.
 func (e *Engine) Play(url string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -48,59 +35,89 @@ func (e *Engine) Play(url string) error {
 		e.stopInternal()
 	}
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	req, err := http.NewRequest("GET", url, nil)
+	ytdlpPath, err := exec.LookPath("yt-dlp")
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("yt-dlp is required in PATH for YouTube streaming")
 	}
-	req.Header.Set("User-Agent", "Terminally/1.0 (Terminal Music Player; Go)")
-
-	resp, err := client.Do(req)
+	ffplayPath, err := exec.LookPath("ffplay")
 	if err != nil {
-		return fmt.Errorf("failed to fetch stream: %w", err)
+		return fmt.Errorf("ffplay is required in PATH for YouTube streaming")
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return fmt.Errorf("bad status code: %d", resp.StatusCode)
-	}
+	ytdlp := exec.Command(ytdlpPath,
+		"-f", "bestaudio",
+		"-o", "-",
+		url,
+	)
 
-	// mp3.Decode requires a ReadCloser
-	streamer, format, err := mp3.Decode(resp.Body)
+	ffplay := exec.Command(ffplayPath,
+		"-nodisp",
+		"-autoexit",
+		"-loglevel", "quiet",
+		"-volume", fmt.Sprintf("%d", e.volume),
+		"-i", "pipe:0",
+	)
+
+	streamPipe, err := ytdlp.StdoutPipe()
 	if err != nil {
-		resp.Body.Close()
-		return fmt.Errorf("failed to decode mp3: %w", err)
+		return fmt.Errorf("failed to create yt-dlp stream pipe: %w", err)
+	}
+	ffplay.Stdin = streamPipe
+
+	var ytdlpErr strings.Builder
+	var ffplayErr strings.Builder
+	ytdlp.Stderr = &ytdlpErr
+	ffplay.Stderr = &ffplayErr
+
+	if err := ffplay.Start(); err != nil {
+		return fmt.Errorf("failed to start ffplay: %w", err)
 	}
 
-	e.streamer = streamer
-	e.format = format
-	e.ctrl = &beep.Ctrl{Streamer: streamer, Paused: false}
-	e.volume = &effects.Volume{Streamer: e.ctrl, Base: 2, Volume: 0, Silent: false}
+	if err := ytdlp.Start(); err != nil {
+		_ = ffplay.Process.Kill()
+		return fmt.Errorf("failed to start yt-dlp: %w", err)
+	}
+
+	e.ytdlpCmd = ytdlp
+	e.ffplayCmd = ffplay
 	e.playing = true
 	e.currentTrack = url
+	e.startedAt = time.Now()
 
-	speaker.Play(beep.Seq(e.volume, beep.Callback(func() {
-		e.mu.Lock()
-		e.playing = false
-		e.mu.Unlock()
-	})))
+	go e.waitForCompletion(&ytdlpErr, &ffplayErr)
 
 	return nil
 }
 
-// Pause toggles the pause state.
-func (e *Engine) Pause() {
+func (e *Engine) waitForCompletion(ytdlpErr, ffplayErr *strings.Builder) {
+	e.mu.Lock()
+	ytdlp := e.ytdlpCmd
+	ffplay := e.ffplayCmd
+	e.mu.Unlock()
+
+	if ytdlp != nil {
+		_ = ytdlp.Wait()
+	}
+	if ffplay != nil {
+		_ = ffplay.Wait()
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.ctrl != nil {
-		e.ctrl.Paused = !e.ctrl.Paused
+	e.playing = false
+	e.ytdlpCmd = nil
+	e.ffplayCmd = nil
+	if e.currentTrack != "" && (ytdlpErr.Len() > 0 || ffplayErr.Len() > 0) {
+		// Keep currentTrack for UI context until user starts/stops next playback.
 	}
 }
 
-// Stop stops the playback and closes the streamer.
+// Pause is not supported with ffplay pipe mode.
+func (e *Engine) Pause() {
+	// Intentionally left as no-op.
+}
+
+// Stop stops the playback and kills active processes.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -108,42 +125,47 @@ func (e *Engine) Stop() {
 }
 
 func (e *Engine) stopInternal() {
-	speaker.Clear()
-	if e.streamer != nil {
-		e.streamer.Close()
-		e.streamer = nil
+	if e.ytdlpCmd != nil && e.ytdlpCmd.Process != nil {
+		_ = e.ytdlpCmd.Process.Kill()
+		_, _ = e.ytdlpCmd.Process.Wait()
+		e.ytdlpCmd = nil
+	}
+	if e.ffplayCmd != nil && e.ffplayCmd.Process != nil {
+		_ = e.ffplayCmd.Process.Kill()
+		_, _ = e.ffplayCmd.Process.Wait()
+		e.ffplayCmd = nil
 	}
 	e.playing = false
 	e.currentTrack = ""
+	e.startedAt = time.Time{}
 }
 
-// SetVolume sets the volume level (-10.0 to 0.0 usually, where 0 is max).
-// We'll abstract this to 0-100 for the UI.
+// SetVolume sets playback volume from 0-100 for the next playback start.
 func (e *Engine) SetVolume(vol float64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.volume != nil {
-		// beep.Volume.Volume is logarithmic. 0 is original, -1 is half amplitude, etc.
-		// We'll map UI 0-100 to volume range.
-		e.volume.Volume = vol
+	if vol < 0 {
+		vol = 0
 	}
+	if vol > 100 {
+		vol = 100
+	}
+	e.volume = int(vol)
 }
 
 // IsPlaying returns true if audio is currently playing.
 func (e *Engine) IsPlaying() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.playing && e.ctrl != nil && !e.ctrl.Paused
+	return e.playing
 }
 
-// GetProgress returns the current position and total duration (if available).
+// GetProgress returns elapsed duration for the active stream.
 func (e *Engine) GetProgress() (time.Duration, time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.streamer == nil {
+	if !e.playing || e.startedAt.IsZero() {
 		return 0, 0
 	}
-	pos := e.format.SampleRate.D(e.streamer.Position())
-	len := e.format.SampleRate.D(e.streamer.Len())
-	return pos, len
+	return time.Since(e.startedAt), 0
 }

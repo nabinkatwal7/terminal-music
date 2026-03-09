@@ -1,5 +1,13 @@
 package provider
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
 // Track represents a single audio track or stream.
 type Track struct {
 	ID     string
@@ -22,83 +30,122 @@ type Provider interface {
 	GetName() string
 }
 
-// StaticProvider implements the Provider interface with curated lofi streams.
-type StaticProvider struct{}
-
-// NewStaticProvider returns a new StaticProvider.
-func NewStaticProvider() *StaticProvider {
-	return &StaticProvider{}
+type youtubeQuery struct {
+	ID          string
+	Name        string
+	Description string
+	Query       string
 }
 
-func (p *StaticProvider) GetName() string {
-	return "Curated Lofi"
+var defaultQueries = []youtubeQuery{
+	{
+		ID:          "lofi-focus",
+		Name:        "Lofi Coding",
+		Description: "Lo-fi beats for focused coding sessions.",
+		Query:       "lofi hip hop beats to relax/study to",
+	},
+	{
+		ID:          "jazz-cafe",
+		Name:        "Jazz Cafe",
+		Description: "Instrumental jazz and cafe ambience for flow state.",
+		Query:       "instrumental jazz cafe music",
+	},
+	{
+		ID:          "ambient-focus",
+		Name:        "Ambient Focus",
+		Description: "Deep ambient textures for distraction-free work.",
+		Query:       "ambient focus music no lyrics",
+	},
 }
 
-// GetPlaylists returns a list of predefined lofi playlists.
-func (p *StaticProvider) GetPlaylists() ([]Playlist, error) {
-	return []Playlist{
-		{
-			ID:          "lofi-focus",
-			Name:        "Lofi & Study Beats",
-			Description: "Smooth beats for deep coding sessions.",
-			Tracks: []Track{
-				{
-					ID:     "lofi-radio-ru",
-					Title:  "Lofi Radio",
-					Artist: "lofiradio.ru",
-					URL:    "https://lofiradio.ru/stream",
-				},
-				{
-					ID:     "chillhop-flux",
-					Title:  "Chillhop Radio",
-					Artist: "FluxFM",
-					URL:    "https://streams.fluxfm.de/Chillhop/mp3-128/streams.fluxfm.de/",
-				},
-				{
-					ID:     "lofi-hiphop",
-					Title:  "Lofi HipHop",
-					Artist: "hearme.fm",
-					URL:    "https://hearme.fm/radio/lofi-hiphop",
-				},
-			},
-		},
-		{
-			ID:          "classical-piano",
-			Name:        "Classical & Piano",
-			Description: "Timeless masterpieces for deep work.",
-			Tracks: []Track{
-				{
-					ID:     "klassik-piano",
-					Title:  "Klassik Radio Piano",
-					Artist: "Klassik Radio",
-					URL:    "https://stream.klassikradio.de/piano/mp3-128",
-				},
-				{
-					ID:     "radioparadise-mellow",
-					Title:  "Mellow Mix",
-					Artist: "Radio Paradise",
-					URL:    "http://stream.radioparadise.com/mellow-128",
-				},
-			},
-		},
-		{
-			ID:          "ambient-focus",
-			Name:        "Ambient & Nature",
-			Description: "Natural soundscapes for focus.",
-			Tracks: []Track{
-				{
-					ID:     "nature-ambient",
-					Title:  "Nature Ambient",
-					Artist: "Ambience Radio",
-					URL:    "https://stream.zeno.fm/03n82msm068uv",
-				},
-				{
-					ID:     "deep-focus-ambient",
-					Title:  "Deep Focus",
-					Artist: "Focus FM",
-					URL:    "https://stream.zeno.fm/f3pv487220hvv",
-				},
-			},
-		},
-	}, nil
+// YouTubeProvider implements the Provider interface using yt-dlp search.
+type YouTubeProvider struct {
+	queries []youtubeQuery
+}
+
+// NewYouTubeProvider initializes a YouTube provider without API keys.
+func NewYouTubeProvider() *YouTubeProvider {
+	return &YouTubeProvider{queries: defaultQueries}
+}
+
+func (p *YouTubeProvider) GetName() string {
+	return "YouTube (no API key)"
+}
+
+// GetPlaylists builds curated categories from YouTube search results.
+func (p *YouTubeProvider) GetPlaylists() ([]Playlist, error) {
+	playlists := make([]Playlist, 0, len(p.queries))
+
+	for _, q := range p.queries {
+		tracks, err := p.searchTracks(q.Query)
+		if err != nil {
+			return nil, err
+		}
+
+		playlists = append(playlists, Playlist{
+			ID:          q.ID,
+			Name:        q.Name,
+			Description: q.Description,
+			Tracks:      tracks,
+		})
+	}
+
+	return playlists, nil
+}
+
+type ytDLPEntry struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Uploader string `json:"uploader"`
+	Channel  string `json:"channel"`
+}
+
+func (p *YouTubeProvider) searchTracks(query string) ([]Track, error) {
+	ytDLPPath, err := exec.LookPath("yt-dlp")
+	if err != nil {
+		return nil, fmt.Errorf("yt-dlp is required in PATH for YouTube search")
+	}
+
+	cmd := exec.Command(ytDLPPath, "--dump-json", "--flat-playlist", "ytsearch12:"+query)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("yt-dlp search failed: %w", err)
+	}
+
+	lines := bytes.Split(out, []byte{'\n'})
+	tracks := make([]Track, 0, len(lines))
+	for _, line := range lines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var entry ytDLPEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+		if entry.ID == "" || entry.Title == "" {
+			continue
+		}
+
+		artist := strings.TrimSpace(entry.Uploader)
+		if artist == "" {
+			artist = strings.TrimSpace(entry.Channel)
+		}
+		if artist == "" {
+			artist = "YouTube"
+		}
+
+		tracks = append(tracks, Track{
+			ID:     entry.ID,
+			Title:  entry.Title,
+			Artist: artist,
+			URL:    "https://www.youtube.com/watch?v=" + entry.ID,
+		})
+	}
+
+	if len(tracks) == 0 {
+		return nil, fmt.Errorf("no YouTube tracks found for query %q", query)
+	}
+
+	return tracks, nil
 }
